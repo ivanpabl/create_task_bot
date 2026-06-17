@@ -1,0 +1,13 @@
+# Discord Task Bot — Desktop Agent Configuration
+# Copy this file as config.yml and edit the values.
+
+# Your Discord user ID (right-click profile → Copy ID)
+discord_id: "123456789012345678"
+
+# Backend URL (developer's server with ngrok or VPS)
+backend_url: "https://your-bot.ngrok.io"
+
+# Whisper model settings (optional)
+# whisper_model: "medium"     # tiny, base, small, medium, large-v3 (medium — баланс качества и размера)
+# whisper_device: "cpu"       # cpu or cuda
+# whisper_compute: "int8"     # int8, float16, float32

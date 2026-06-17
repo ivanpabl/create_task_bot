@@ -1,0 +1,114 @@
+name: Build Desktop Agent
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r desktop_agent/requirements.txt
+          pip install pyinstaller
+          pip install "numpy<2"
+
+      - name: Find faster_whisper assets
+        shell: python
+        run: |
+          import faster_whisper, os
+          assets = os.path.join(os.path.dirname(faster_whisper.__file__), 'assets')
+          print(f"ASSETS_PATH={assets}")
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"ASSETS_PATH={assets}\n")
+
+      - name: Build agent
+        run: |
+          cd desktop_agent
+          python -m PyInstaller --onedir `
+            --name "discord-task-agent" `
+            --distpath "dist" `
+            --workpath "build" `
+            --add-data "config.yml.example;." `
+            --add-data "vbcable\*;vbcable" `
+            --add-data "$env:ASSETS_PATH;faster_whisper/assets" `
+            --hidden-import "discord_rpc" `
+            --hidden-import "faster_whisper" `
+            --hidden-import "ctranslate2" `
+            --hidden-import "silero_vad" `
+            --hidden-import "silero_vad.data" `
+            --hidden-import "silero_vad.utils_vad" `
+            --hidden-import "silero_vad.model" `
+            --hidden-import "sounddevice" `
+            --hidden-import "sounddevice._portaudio" `
+            --hidden-import "win32file" `
+            --hidden-import "win32pipe" `
+            --hidden-import "pywintypes" `
+            --hidden-import "httpx" `
+            --hidden-import "websockets" `
+            --hidden-import "yaml" `
+            --hidden-import "dotenv" `
+            --hidden-import "torchaudio" `
+            --exclude-module "matplotlib" `
+            --exclude-module "tkinter" `
+            --exclude-module "torchvision" `
+            --exclude-module "transformers" `
+            --exclude-module "datasets" `
+            --exclude-module "tensorflow" `
+            --exclude-module "cv2" `
+            --exclude-module "IPython" `
+            --exclude-module "jedi" `
+            --exclude-module "pytest" `
+            --exclude-module "PIL" `
+            --exclude-module "pandas" `
+            --exclude-module "scipy" `
+            --exclude-module "sklearn" `
+            --exclude-module "lxml" `
+            agent.py
+
+      - name: Copy additional files
+        shell: pwsh
+        run: |
+          $dist = "desktop_agent/dist/discord-task-agent"
+          Copy-Item "desktop_agent/discord_rpc.py" "$dist/" -Force
+          Copy-Item "desktop_agent/wasapi_capture.py" "$dist/" -Force
+          Copy-Item "desktop_agent/vbcable/*" "$dist/" -Force -Recurse
+
+      - name: Create config.yml
+        shell: pwsh
+        run: |
+          @"
+          # discord_id: "вставьте_свой_id_со_страницы_/download_после_авторизации"
+          # backend_url: "https://ваш-домен.ru"
+          whisper_model: medium
+          whisper_device: cpu
+          whisper_compute: int8
+          "@ | Out-File -FilePath "desktop_agent/dist/discord-task-agent/config.yml" -Encoding utf8
+
+      - name: Create ZIP
+        run: |
+          Compress-Archive -Path desktop_agent/dist/discord-task-agent/* -DestinationPath discord-task-agent.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-task-agent
+          path: discord-task-agent.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: discord-task-agent.zip
