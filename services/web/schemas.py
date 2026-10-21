@@ -2,6 +2,8 @@ from pydantic import BaseModel
 from typing import Optional
 from uuid import UUID
 
+from services.database import TaskStatus
+
 
 class MessageCreate(BaseModel):
     message_id: str
@@ -46,7 +48,7 @@ class TaskOut(BaseModel):
 
 
 class TaskUpdate(BaseModel):
-    status: Optional[str] = None
+    status: Optional[TaskStatus] = None
     assignee: Optional[str] = None
 
 

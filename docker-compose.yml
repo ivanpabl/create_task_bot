@@ -13,6 +13,17 @@ services:
       timeout: 5s
       retries: 5
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
   ollama:
     image: ollama/ollama
     volumes:
@@ -21,15 +32,25 @@ services:
 
   api:
     build: .
-    command: uvicorn services.web.main:app --host 0.0.0.0 --port 8000
+    # WS limits/heartbeat are enforced by uvicorn before frames reach the app.
+    # TLS terminates at the reverse proxy in front of this port; never expose it directly.
+    command: >
+      uvicorn services.web.main:app --host 0.0.0.0 --port 8000
+      --ws-max-size 65536 --ws-ping-interval 20 --ws-ping-timeout 20
+      --proxy-headers
     ports:
-      - "8100:8000"
+      - "127.0.0.1:8100:8000"
     env_file:
       - .env
     environment:
       POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@db:5432/discord_tasks
-      BACKEND_URL: http://create-task.ru
+      BACKEND_URL: https://create-task.ru
       OLLAMA_URL: http://ollama:11434
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      # Addresses of the reverse proxy allowed to set X-Forwarded-For (needed for per-IP rate limits).
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     depends_on:
       db:
         condition: service_healthy
@@ -51,4 +72,5 @@ services:
 
 volumes:
   pgdata:
+  chdata:
   ollama_data:

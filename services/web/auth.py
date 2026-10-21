@@ -22,10 +22,27 @@ oauth.register(
 )
 
 
+TOKEN_TYPE_USER = 'user'
+TOKEN_TYPE_AGENT = 'agent'
+AGENT_TOKEN_TTL = timedelta(days=365)
+
+
 def create_jwt(user_id: UUID) -> str:
     payload = {
         'sub': str(user_id),
+        'typ': TOKEN_TYPE_USER,
         'exp': datetime.utcnow() + timedelta(days=7),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm='HS256')
+
+
+def create_agent_token(user_id: UUID | str, discord_id: str) -> str:
+    """Long-lived credential for the desktop agent. Accepted only by the agent WebSocket."""
+    payload = {
+        'sub': str(user_id),
+        'did': str(discord_id),
+        'typ': TOKEN_TYPE_AGENT,
+        'exp': datetime.utcnow() + AGENT_TOKEN_TTL,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm='HS256')
 
@@ -36,3 +53,22 @@ def verify_jwt(token: str) -> dict | None:
         return payload
     except JWTError:
         return None
+
+
+def verify_user_jwt(token: str) -> dict | None:
+    """Browser session token. Tokens issued before 'typ' existed are treated as user tokens."""
+    payload = verify_jwt(token)
+    if payload is None or not payload.get('sub'):
+        return None
+    if payload.get('typ', TOKEN_TYPE_USER) != TOKEN_TYPE_USER:
+        return None
+    return payload
+
+
+def verify_agent_token(token: str) -> dict | None:
+    payload = verify_jwt(token)
+    if payload is None or payload.get('typ') != TOKEN_TYPE_AGENT:
+        return None
+    if not payload.get('sub') or not payload.get('did'):
+        return None
+    return payload

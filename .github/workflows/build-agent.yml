@@ -90,7 +90,7 @@ jobs:
         shell: pwsh
         run: |
           @"
-          # discord_id: "вставьте_свой_id_со_страницы_/download_после_авторизации"
+          # agent_token выдаётся при привязке по пин-коду при первом запуске
           # backend_url: "https://ваш-домен.ru"
           whisper_model: medium
           whisper_device: cpu

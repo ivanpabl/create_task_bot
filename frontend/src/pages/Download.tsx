@@ -87,7 +87,7 @@ export default function Download() {
         </p>
 
         <div className="bg-gray-900/50 rounded-lg p-4 mb-6 border border-gray-700">
-          <p className="text-sm text-gray-400 mb-2">Your Discord ID (for manual setup):</p>
+          <p className="text-sm text-gray-400 mb-2">Your Discord ID:</p>
           <div className="flex items-center gap-2">
             <code className="text-base text-indigo-300 font-mono bg-gray-800 px-3 py-2 rounded flex-1 border border-gray-600 truncate">
               {discordId || 'Loading...'}

@@ -1,12 +1,11 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from uuid import UUID
 
-from services.web.database import get_db, get_session_factory
+from services.web.database import get_session_factory
 from services.web.models import User
-from services.web.auth import verify_jwt
+from services.web.auth import verify_user_jwt
 from services.web.config import settings
 from services.web.json_user_store import get_user_by_id as json_get_user
 
@@ -15,9 +14,8 @@ bearer_scheme = HTTPBearer()
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
 ) -> User | dict:
-    payload = verify_jwt(credentials.credentials)
+    payload = verify_user_jwt(credentials.credentials)
     if payload is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid token')
 

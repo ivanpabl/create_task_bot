@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     ollama_model: str = 'llama3'
     alert_webhook_url: str = ''
     alert_level: str = 'error'
+    clickhouse_url: str = ''
+    clickhouse_user: str = 'default'
+    clickhouse_password: str = ''
+    clickhouse_database: str = 'default'
 
     model_config = {'env_file': str(Path(__file__).resolve().parents[2] / '.env'), 'extra': 'ignore'}
 

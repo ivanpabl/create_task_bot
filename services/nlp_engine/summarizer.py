@@ -67,15 +67,17 @@ def _parse_response(text: str) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    # Try to find `[...]` anywhere in the text
-    match = re.search(r'\[[\s\S]*?\]', text)
-    if match:
+    # Try to find a JSON array anywhere in the text. A regex can't tell a closing
+    # bracket from one inside a string, so let the decoder find where the array ends.
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\[', text):
         try:
-            tasks = json.loads(match.group(0))
-            if isinstance(tasks, list):
-                return tasks
+            tasks, _ = decoder.raw_decode(text, match.start())
         except json.JSONDecodeError:
-            pass
+            continue
+        # Skip stray lists like "пункт [1]" that precede the real answer.
+        if isinstance(tasks, list) and all(isinstance(t, dict) for t in tasks):
+            return tasks
 
     print(f"[summarizer] Could not parse response: {text[:300]}")
     return []

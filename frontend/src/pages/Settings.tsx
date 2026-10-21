@@ -5,8 +5,13 @@ const WS_BASE = import.meta.env.VITE_WS_URL || `${window.location.protocol === '
 interface Device {
   id: number;
   name: string;
-  channels: number;
+  channels?: number;
 }
+
+// Server close codes: 4401 = bad/expired JWT (don't retry), 1008 = rate limited.
+const CLOSE_UNAUTHORIZED = 4401;
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
 
 interface Transcription {
   text: string;
@@ -15,12 +20,16 @@ interface Transcription {
 
 export default function Agent() {
   const [connected, setConnected] = useState(false);
+  const [agentConnected, setAgentConnected] = useState(false);
   const [agentStatus, setAgentStatus] = useState('idle');
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(null);
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([]);
   const [agentUserId, setAgentUserId] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const retryDelayRef = useRef(RECONNECT_MIN_MS);
+  const retryTimerRef = useRef<number | null>(null);
+  const unmountedRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -34,17 +43,23 @@ export default function Agent() {
     const ws = new WebSocket(`${WS_BASE}/api/agent/ws/frontend`);
     wsRef.current = ws;
 
-    ws.onopen = () => setConnected(true);
+    // Browsers can't set WebSocket headers; the JWT goes in the first message, never in the URL.
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'auth', token }));
+      setConnected(true);
+      retryDelayRef.current = RECONNECT_MIN_MS;
+    };
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
         switch (msg.type) {
           case 'status':
+            setAgentConnected(!!msg.connected);
             setAgentStatus(msg.status);
-            if (msg.device_id != null) setSelectedDeviceId(msg.device_id);
+            setSelectedDeviceId(msg.device_id ?? null);
             if (msg.devices) setDevices(msg.devices);
-            if (msg.user_id != null) setAgentUserId(msg.user_id);
+            setAgentUserId(msg.user_id ?? null);
             break;
           case 'devices':
             setDevices(msg.devices);
@@ -60,17 +75,26 @@ export default function Agent() {
       } catch {}
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       setConnected(false);
-      setTimeout(connect, 3000);
+      setAgentConnected(false);
+      if (unmountedRef.current || event.code === CLOSE_UNAUTHORIZED) return;
+      const delay = retryDelayRef.current * (0.5 + Math.random() / 2);
+      retryDelayRef.current = Math.min(retryDelayRef.current * 2, RECONNECT_MAX_MS);
+      retryTimerRef.current = window.setTimeout(connect, delay);
     };
 
     ws.onerror = () => ws.close();
   }, []);
 
   useEffect(() => {
+    unmountedRef.current = false;
     connect();
-    return () => wsRef.current?.close();
+    return () => {
+      unmountedRef.current = true;
+      if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+      wsRef.current?.close();
+    };
   }, [connect]);
 
   const sendCommand = (action: string, params?: Record<string, unknown>) => {
@@ -88,11 +112,11 @@ export default function Agent() {
 
         <div className="flex items-center gap-4 mb-6 bg-gray-900/50 rounded-lg p-4 border border-gray-700">
           <div className={`w-3.5 h-3.5 rounded-full ${
-            connected ? (isListening ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.5)]') : 'bg-red-500'
+            connected && agentConnected ? (isListening ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.5)]') : 'bg-red-500'
           }`} />
           <div>
             <span className="text-sm font-medium">
-              {!connected ? 'Disconnected' : agentStatus === 'idle' ? 'Idle' : agentStatus === 'listening' ? 'Listening...' : agentStatus === 'processing' ? 'Processing...' : agentStatus}
+              {!connected ? 'Disconnected' : !agentConnected ? 'Agent offline' : agentStatus === 'idle' ? 'Idle' : agentStatus === 'listening' ? 'Listening...' : agentStatus === 'processing' ? 'Processing...' : agentStatus}
             </span>
             {agentUserId && (
               <span className="text-xs text-green-400 ml-3">✓ User linked</span>
@@ -114,14 +138,14 @@ export default function Agent() {
             >
               <option value="" disabled>Select audio device...</option>
               {devices.map((d) => (
-                <option key={d.id} value={d.id}>{d.name} ({d.channels} ch)</option>
+                <option key={d.id} value={d.id}>{d.name}{d.channels != null ? ` (${d.channels} ch)` : ''}</option>
               ))}
             </select>
           </div>
 
           <button
             onClick={() => sendCommand(isListening ? 'stop' : 'start')}
-            disabled={!connected || selectedDeviceId == null || devices.length === 0}
+            disabled={!connected || !agentConnected || selectedDeviceId == null || devices.length === 0}
             className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition shadow-sm ${
               isListening
                 ? 'bg-red-600 hover:bg-red-500 text-white'

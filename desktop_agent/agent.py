@@ -2,8 +2,12 @@ import asyncio
 import functools
 import json
 import os
+import random
 import sys
+from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
+from uuid import uuid4
 
 print = functools.partial(print, flush=True)
 from pathlib import Path
@@ -35,13 +39,28 @@ if CONFIG_PATH.exists():
         _config = yaml.safe_load(f) or {}
 
 BACKEND_URL = str(_config.get('backend_url', os.getenv('BACKEND_URL', 'http://localhost:8000'))).rstrip('/')
-BACKEND_WS_URL = BACKEND_URL.replace('http://', 'ws://').replace('https://', 'wss://')
+_backend = urlparse(BACKEND_URL)
+BACKEND_WS_URL = _backend._replace(scheme='wss' if _backend.scheme == 'https' else 'ws').geturl()
+LOOPBACK_HOSTS = {'localhost', '127.0.0.1', '::1'}
 WHISPER_MODEL = str(_config.get('whisper_model', os.getenv('WHISPER_MODEL', 'medium')))
 WHISPER_DEVICE = str(_config.get('whisper_device', os.getenv('WHISPER_DEVICE', 'cpu')))
 WHISPER_COMPUTE = str(_config.get('whisper_compute', os.getenv('WHISPER_COMPUTE_TYPE', 'int8')))
 DISCORD_CLIENT_ID = str(_config.get('discord_client_id', os.getenv('DISCORD_CLIENT_ID', '')))
 SAMPLE_RATE = 16000
 BLOCK_DURATION = 30
+# If Whisper is slower than real time, keep at most this much unprocessed audio
+# and drop the oldest beyond it instead of growing memory and latency forever.
+MAX_BACKLOG_SECONDS = 90
+
+WS_MAX_SIZE = 64 * 1024
+# Unacknowledged messages kept across reconnects (~4 hours of transcriptions).
+OUTBOX_MAX = 500
+# Replay pace after a reconnect; must stay below the server's per-connection rate limit.
+OUTBOX_SEND_RATE = 5
+RECONNECT_MIN_DELAY = 1
+RECONNECT_MAX_DELAY = 60
+CLOSE_REPLACED = 4000
+CLOSE_UNAUTHORIZED = 4401
 
 _whisper_model = None
 _audio_buffer = []
@@ -222,7 +241,8 @@ def _open_native_stream(device_id: int, channels: int, extra, callback) -> tuple
     return stream, native_rate
 
 
-async def capture_loop(ws=None, device_id: int = None, loopback: bool = False):
+async def capture_loop(emit=None, device_id: int = None, loopback: bool = False):
+    """emit(msg, reliable=False) delivers messages to the backend; None = local mode."""
     global _audio_buffer, _accumulated, _running, _stream
     import sounddevice as sd
 
@@ -342,8 +362,8 @@ async def capture_loop(ws=None, device_id: int = None, loopback: bool = False):
         dev_info = sd.query_devices(device_id)
         mode = 'wasapi_loopback' if wasapi_cap else ('loopback' if loopback else 'mic')
         print(f"[agent] Started {mode} capture on device {device_id}: {dev_info['name']} @ {device_rate} Hz")
-        if ws:
-            await ws.send(json.dumps({'type': 'status', 'status': 'listening', 'device_id': device_id}))
+        if emit:
+            emit({'type': 'status', 'status': 'listening', 'device_id': device_id})
 
         # ── Main capture loop ─────────────────────────────────────────
         chunk_size = device_rate * BLOCK_DURATION
@@ -375,6 +395,12 @@ async def capture_loop(ws=None, device_id: int = None, loopback: bool = False):
                 _audio_buffer = []
                 _accumulated = np.concatenate([_accumulated, chunk])
 
+            max_backlog = device_rate * MAX_BACKLOG_SECONDS
+            if len(_accumulated) > max_backlog:
+                dropped = len(_accumulated) - max_backlog
+                _accumulated = _accumulated[dropped:]
+                print(f"[agent] WARNING: transcription is falling behind, dropped {dropped / device_rate:.0f}s of oldest audio")
+
             if len(_accumulated) >= chunk_size:
                 segment = _accumulated[:chunk_size]
                 _accumulated = _accumulated[chunk_size:]
@@ -393,14 +419,13 @@ async def capture_loop(ws=None, device_id: int = None, loopback: bool = False):
                 if text:
                     print(f"[agent] Transcription: {text[:80]}...")
                     ts = datetime.utcnow().isoformat()
-                    if ws:
-                        await ws.send(json.dumps({'type': 'transcription', 'text': text, 'timestamp': ts}))
+                    if emit:
+                        emit({'type': 'transcription', 'text': text, 'timestamp': ts}, reliable=True)
                 else:
                     print("[agent] Whisper returned empty")
 
-                if _running:
-                    if ws:
-                        await ws.send(json.dumps({'type': 'status', 'status': 'listening', 'device_id': device_id}))
+                if _running and emit:
+                    emit({'type': 'status', 'status': 'listening', 'device_id': device_id})
 
 
     except Exception as e:
@@ -422,8 +447,8 @@ async def capture_loop(ws=None, device_id: int = None, loopback: bool = False):
             except Exception:
                 pass
         _running = False
-        if ws:
-            await ws.send(json.dumps({'type': 'status', 'status': 'idle'}))
+        if emit:
+            emit({'type': 'status', 'status': 'idle', 'device_id': device_id})
 
 
 def transcribe_audio(audio: np.ndarray) -> str | None:
@@ -433,207 +458,323 @@ def transcribe_audio(audio: np.ndarray) -> str | None:
     return text if text.strip() else None
 
 
+def backend_is_secure(url: str) -> bool:
+    """Only TLS is allowed, except for a backend on this machine (local development)."""
+    parsed = urlparse(url)
+    if parsed.scheme == 'https':
+        return True
+    return parsed.scheme == 'http' and parsed.hostname in LOOPBACK_HOSTS
+
+
+def save_config_value(key: str, value):
+    data = {}
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    _config.clear()
+    _config.update(data)
+
+
 async def pair_via_code() -> str | None:
     """
-    Ask user for a pairing code and claim it from the backend.
-    Returns discord_id on success, None on failure.
+    Ask user for a pairing code and exchange it for an agent token.
+    Returns the token on success, None on failure.
     """
     print("\n[agent] ════════════════════════════════════════")
-    print("[agent]   Добро пожаловать! Агент не настроен.")
+    print("[agent]   Агент не привязан к аккаунту.")
     print("[agent]   1. Откройте сайт → Download Agent")
     print("[agent]   2. Нажмите «Сгенерировать код»")
     print("[agent]   3. Введите код ниже")
     print("[agent] ════════════════════════════════════════\n")
-    code = input("[agent] Введите пин-код: ").strip().upper()
+    code = (await asyncio.to_thread(input, "[agent] Введите пин-код: ")).strip()
     if not code:
         return None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{BACKEND_URL}/api/pairing/claim/{code}")
+            resp = await client.post(f"{BACKEND_URL}/api/pairing/claim", json={'code': code})
             if resp.status_code == 200:
                 data = resp.json()
-                discord_id = data.get('discord_id')
-                print(f"[agent] Подключение успешно! Discord ID: {discord_id}")
-                return discord_id
-            elif resp.status_code == 410:
-                print("[agent] Ошибка: код истёк (действителен 10 минут). Сгенерируйте новый на сайте.")
+                print(f"[agent] Подключение успешно! Discord ID: {data.get('discord_id')}")
+                save_config_value('discord_id', data.get('discord_id'))
+                save_config_value('agent_token', data['agent_token'])
+                return data['agent_token']
+            elif resp.status_code == 429:
+                print("[agent] Ошибка: слишком много попыток. Подождите 10 минут.")
             else:
-                print(f"[agent] Ошибка: код не найден. Проверьте правильность ввода.")
+                print("[agent] Ошибка: код не найден или истёк (действителен 10 минут). Сгенерируйте новый на сайте.")
     except Exception as e:
         print(f"[agent] Ошибка подключения к серверу: {e}")
     return None
 
 
-async def main():
-    import websockets
-    import httpx
+class Outbox:
+    """
+    Messages that must reach the backend (transcriptions, call boundaries).
+    Each gets a sequence number; it stays queued until the server acks it and is
+    re-sent after a reconnect. The server drops duplicates by (stream_id, seq).
+    """
 
-    discord_id = _config.get('discord_id') or os.getenv('DISCORD_USER_ID')
-    if not discord_id:
-        users_store_path = BASE_DIR.parent / 'users_store.json'
+    def __init__(self, maxlen: int):
+        self.stream_id = uuid4().hex
+        self._seq = 0
+        self._maxlen = maxlen
+        self._items: deque[dict] = deque()
+        self._event = asyncio.Event()
+
+    def put(self, msg: dict):
+        self._seq += 1
+        if len(self._items) >= self._maxlen:
+            dropped = self._items.popleft()
+            print(f"[agent] WARNING: outbox full, dropped unsent {dropped.get('type')} #{dropped['seq']}")
+        self._items.append({**msg, 'seq': self._seq, 'stream_id': self.stream_id})
+        self._event.set()
+
+    def ack(self, seq: int):
+        while self._items and self._items[0]['seq'] <= seq:
+            self._items.popleft()
+
+    def __len__(self):
+        return len(self._items)
+
+    async def pump(self, ws):
+        """Send everything not yet sent on this connection; runs until the connection dies."""
+        sent_upto = 0
+        while True:
+            pending = [m for m in self._items if m['seq'] > sent_upto]
+            if not pending:
+                self._event.clear()
+                await self._event.wait()
+                continue
+            for m in pending:
+                await ws.send(json.dumps(m))
+                sent_upto = m['seq']
+                await asyncio.sleep(1 / OUTBOX_SEND_RATE)
+
+
+class Agent:
+    def __init__(self, token: str):
+        self.token = token
+        self.outbox = Outbox(OUTBOX_MAX)
+        self.ws = None
+        self.status = {'type': 'status', 'status': 'idle', 'device_id': None}
+        self.capture_task: asyncio.Task | None = None
+        self.devices: list[dict] = []
+        self.lb_id: int | None = None
+        self.mic_id: int | None = None
+        self.rpc: DiscordRPCClient | None = None
+
+    # ── Messaging ────────────────────────────────────────────────────────
+
+    def emit(self, msg: dict, reliable: bool = False):
+        if msg.get('type') == 'status':
+            self.status = msg
+        if reliable:
+            self.outbox.put(msg)
+        elif self.ws is not None:
+            asyncio.create_task(self._send_best_effort(self.ws, msg))
+
+    @staticmethod
+    async def _send_best_effort(ws, msg: dict):
         try:
-            if users_store_path.exists():
-                with open(users_store_path) as f:
-                    users = json.load(f)
-                    if users:
-                        discord_id = users[0].get('discord_id')
+            await ws.send(json.dumps(msg))
         except Exception:
-            pass
+            pass  # status is re-sent in 'register' after reconnect
 
-    # If still no ID, try pairing via code
-    if not discord_id:
-        discord_id = await pair_via_code()
+    # ── Capture ──────────────────────────────────────────────────────────
 
-    query = f'?discord_id={discord_id}' if discord_id else ''
-    ws_url = f"{BACKEND_WS_URL}/api/agent/ws{query}"
+    def discover_devices(self):
+        self.lb_id = get_loopback_device_id()
+        cable_id = get_cable_device_id()
+        vm_id = get_voicemeeter_device_id()
+        self.mic_id = get_microphone_device_id()
+        lb_id, mic_id = self.lb_id, self.mic_id
+        devices = []
+        if lb_id is not None:
+            devices.append({'id': lb_id, 'name': 'System Audio (loopback)'})
+        if cable_id is not None and cable_id != lb_id:
+            devices.append({'id': cable_id, 'name': 'VB-CABLE'})
+        if vm_id is not None and vm_id != lb_id and vm_id != cable_id:
+            devices.append({'id': vm_id, 'name': 'Voicemeeter'})
+        if mic_id is not None and mic_id not in (lb_id, cable_id, vm_id):
+            devices.append({'id': mic_id, 'name': 'Microphone'})
+        self.devices = devices
+        self.status['device_id'] = lb_id if lb_id is not None else mic_id
 
-    if not discord_id:
-        print("[agent] ERROR: не удалось получить Discord ID.")
-        print("[agent] Откройте сайт → Download Agent, скопируйте ID и вставьте в config.yml")
-        input("[agent] Нажмите Enter для выхода...")
+    async def stop_capture(self, reason='unknown'):
+        global _running
+        if self.capture_task is None:
+            return
+        print(f"[agent] stop_capture (reason={reason})")
+        _running = False
+        task, self.capture_task = self.capture_task, None
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.emit({'type': 'call_end'}, reliable=True)
+
+    async def start_capture(self, reason='unknown'):
+        print(f"[agent] start_capture (reason={reason})")
+        await self.stop_capture(reason='restart')
+        device_id = self.lb_id if self.lb_id is not None else self.mic_id
+        if device_id is None:
+            print("[agent] No audio device available")
+            return
+        self.emit({'type': 'call_start'}, reliable=True)
+        self.capture_task = asyncio.create_task(
+            capture_loop(self.emit, device_id, loopback=(self.lb_id is not None and device_id == self.lb_id))
+        )
+
+    async def setup_capture(self):
+        """Capture lives for the whole process, independent of the WebSocket connection."""
+        self.discover_devices()
+        if DISCORD_CLIENT_ID:
+            self.rpc = DiscordRPCClient(DISCORD_CLIENT_ID)
+            self.rpc.on_voice_join = lambda: asyncio.create_task(self.start_capture(reason='rpc_join'))
+            self.rpc.on_voice_leave = lambda: asyncio.create_task(self.stop_capture(reason='rpc_leave'))
+            self.rpc.start()
+            await asyncio.sleep(3)
+            if self.rpc.is_connected:
+                print("[agent] RPC connected — will capture during calls only")
+                return
+            print("[agent] RPC not available, falling back to always-on capture")
+        await self.start_capture(reason='always_on')
+
+    # ── Connection ───────────────────────────────────────────────────────
+
+    async def _handle_server_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(msg, dict):
+            return
+        if msg.get('type') == 'ack' and isinstance(msg.get('seq'), int):
+            self.outbox.ack(msg['seq'])
+        elif msg.get('type') == 'command':
+            action = msg.get('action')
+            print(f"[agent] Command from backend: {action}")
+            if action == 'start':
+                asyncio.create_task(self.start_capture(reason='backend_cmd'))
+            elif action == 'stop':
+                asyncio.create_task(self.stop_capture(reason='backend_cmd'))
+
+    async def _run_connection(self, ws):
+        await ws.send(json.dumps({
+            'type': 'register',
+            'devices': self.devices,
+            'status': self.status.get('status', 'idle'),
+            'device_id': self.status.get('device_id'),
+        }))
+        self.ws = ws
+        if len(self.outbox):
+            print(f"[agent] Re-sending {len(self.outbox)} buffered message(s)")
+        pump = asyncio.create_task(self.outbox.pump(ws))
+        try:
+            async for raw in ws:
+                await self._handle_server_message(raw)
+        finally:
+            self.ws = None
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+    async def connection_loop(self) -> str:
+        """Returns 'unauthorized' or 'replaced' when reconnecting makes no sense."""
+        import websockets
+        from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidHandshake, InvalidURI
+
+        loop = asyncio.get_running_loop()
+        delay = RECONNECT_MIN_DELAY
+        ws_url = f"{BACKEND_WS_URL}/api/agent/ws"
+
+        while True:
+            print(f"[agent] Connecting to WebSocket: {ws_url}")
+            connected_at = None
+            close_code = None
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    additional_headers={'Authorization': f'Bearer {self.token}'},
+                    open_timeout=15,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_size=WS_MAX_SIZE,
+                ) as ws:
+                    connected_at = loop.time()
+                    print("[agent] Connected to WebSocket")
+                    try:
+                        await self._run_connection(ws)
+                    except ConnectionClosed:
+                        pass
+                    close_code = ws.close_code
+            except InvalidStatus as e:
+                if e.response.status_code in (401, 403):
+                    return 'unauthorized'
+                print(f"[agent] Server rejected connection: HTTP {e.response.status_code}")
+            except (OSError, asyncio.TimeoutError, InvalidHandshake, InvalidURI) as e:
+                print(f"[agent] Connection failed: {e}")
+            except Exception as e:
+                print(f"[agent] Unexpected connection error: {e}")
+
+            if close_code == CLOSE_REPLACED:
+                return 'replaced'
+            if close_code == CLOSE_UNAUTHORIZED:
+                return 'unauthorized'
+
+            # Exponential backoff with jitter; reset once a connection has proven stable.
+            if connected_at is not None and loop.time() - connected_at > 30:
+                delay = RECONNECT_MIN_DELAY
+            sleep_for = delay * random.uniform(0.5, 1.0)
+            print(f"[agent] Disconnected (code={close_code}). Reconnecting in {sleep_for:.1f}s...")
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+
+
+async def main():
+    if not backend_is_secure(BACKEND_URL):
+        print(f"[agent] ERROR: backend_url={BACKEND_URL} не использует https.")
+        print("[agent] Транскрипции разговоров нельзя передавать без шифрования. Укажите https:// в config.yml.")
+        await asyncio.to_thread(input, "[agent] Нажмите Enter для выхода...")
         return
 
-    print(f"[agent] Starting — connecting to {BACKEND_URL}")
-    print(f"[agent] Discord ID: {discord_id}")
+    token = _config.get('agent_token') or os.getenv('AGENT_TOKEN')
+    if not token and _config.get('discord_id'):
+        print("[agent] config.yml от старой версии: нужна повторная привязка по коду.")
+
+    print(f"[agent] Starting — backend {BACKEND_URL}")
     print(f"[agent] Whisper model: {WHISPER_MODEL} ({WHISPER_DEVICE}, {WHISPER_COMPUTE})")
 
+    agent = None
     while True:
-        print(f"[agent] Connecting to WebSocket: {ws_url}")
-        try:
-            async for ws in websockets.connect(ws_url, ping_timeout=10, close_timeout=10):
-                print(f"[agent] Connected to WebSocket")
-                rpc: DiscordRPCClient | None = None
-                capture_task: asyncio.Task | None = None
-                rpc_available = False
-                try:
-                    print(f"[agent] Registered as discord user {discord_id}")
+        while not token:
+            token = await pair_via_code()
 
-                    devices_list = []
-                    lb_id = get_loopback_device_id()
-                    cable_id = get_cable_device_id()
-                    vm_id = get_voicemeeter_device_id()
-                    mic_id = get_microphone_device_id()
-                    if lb_id is not None:
-                        devices_list.append({'id': lb_id, 'name': 'System Audio (loopback)'})
-                    if cable_id is not None and cable_id != lb_id:
-                        devices_list.append({'id': cable_id, 'name': 'VB-CABLE'})
-                    if vm_id is not None and vm_id != lb_id and vm_id != cable_id:
-                        devices_list.append({'id': vm_id, 'name': 'Voicemeeter'})
-                    if mic_id is not None and mic_id != lb_id and mic_id != cable_id and mic_id != vm_id:
-                        devices_list.append({'id': mic_id, 'name': 'Microphone'})
+        if agent is None:
+            agent = Agent(token)
+            await agent.setup_capture()
+        agent.token = token
 
-                    register_msg = {
-                        'type': 'register',
-                        'devices': devices_list,
-                        'status': 'idle',
-                        'device_id': lb_id if lb_id is not None else mic_id,
-                        'discord_id': discord_id,
-                    }
-                    await ws.send(json.dumps(register_msg))
-
-                    # ── RPC watcher ──────────────────────────────────────────────
-
-                    async def stop_capture(reason='unknown'):
-                        nonlocal capture_task
-                        global _running
-                        print(f"[agent] stop_capture (reason={reason})")
-                        _running = False
-                        if capture_task and not capture_task.done():
-                            capture_task.cancel()
-                            try:
-                                await capture_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                            capture_task = None
-                        try:
-                            await ws.send(json.dumps({'type': 'call_end'}))
-                            print("[agent] -> call_end sent")
-                        except Exception as e:
-                            print(f"[agent] -> call_end send error: {e}")
-
-                    async def start_capture(reason='unknown'):
-                        nonlocal capture_task, rpc_available
-                        print(f"[agent] start_capture (reason={reason})")
-                        await stop_capture(reason='restart')
-                        device_id = lb_id if lb_id is not None else mic_id
-                        if device_id is None:
-                            print("[agent] No audio device available")
-                            return
-                        capture_task = asyncio.create_task(
-                            capture_loop(ws, device_id, loopback=(lb_id is not None and device_id == lb_id))
-                        )
-                        try:
-                            await ws.send(json.dumps({'type': 'call_start'}))
-                            print("[agent] -> call_start sent")
-                        except Exception as e:
-                            print(f"[agent] -> call_start send error: {e}")
-
-                    def on_join():
-                        print("[rpc] on_join callback fired")
-                        asyncio.create_task(start_capture(reason='rpc_join'))
-
-                    def on_leave():
-                        print("[rpc] on_leave callback fired")
-                        asyncio.create_task(stop_capture(reason='rpc_leave'))
-
-                    if DISCORD_CLIENT_ID:
-                        rpc = DiscordRPCClient(DISCORD_CLIENT_ID)
-                        rpc.on_voice_join = on_join
-                        rpc.on_voice_leave = on_leave
-                        rpc.start()
-                        await asyncio.sleep(3)
-                        if rpc.is_connected:
-                            rpc_available = True
-                            print("[agent] RPC connected — will capture during calls only")
-                        else:
-                            print("[agent] RPC not available, falling back to always-on capture")
-
-                    if not rpc_available:
-                        device_id = lb_id if lb_id is not None else mic_id
-                        if device_id is not None:
-                            print("[agent] Fallback: auto-start capture")
-                            capture_task = asyncio.create_task(
-                                capture_loop(ws, device_id, loopback=(lb_id is not None))
-                            )
-
-                    # ── Command loop ──────────────────────────────────────────────
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if msg.get('type') != 'command':
-                            continue
-
-                        action = msg.get('action')
-                        print(f"[agent] Command from backend: {action}")
-
-                        if action == 'start':
-                            await start_capture(reason='backend_cmd')
-
-                        elif action == 'stop':
-                            await stop_capture(reason='backend_cmd')
-
-                        elif action == 'select_device':
-                            pass
-
-                except websockets.ConnectionClosed:
-                    print("[agent] Disconnected. Reconnecting in 3s...")
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    print(f"[agent] Error: {e}")
-                    await asyncio.sleep(3)
-                finally:
-                    await stop_capture()
-                    if rpc:
-                        rpc.stop()
-        except (OSError, websockets.InvalidURI, asyncio.TimeoutError) as e:
-            print(f"[agent] Connection failed: {e}, retrying in 5s...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f"[agent] Unexpected connection error: {e}, retrying in 5s...")
-            await asyncio.sleep(5)
+        result = await agent.connection_loop()
+        if result == 'replaced':
+            print("[agent] К этому аккаунту подключился другой экземпляр агента. Этот экземпляр завершает работу.")
+            await agent.stop_capture(reason='replaced')
+            if agent.rpc:
+                agent.rpc.stop()
+            await asyncio.to_thread(input, "[agent] Нажмите Enter для выхода...")
+            return
+        # 'unauthorized': token expired or revoked — pair again, keep capturing meanwhile.
+        print("[agent] Сервер отклонил токен агента. Нужна повторная привязка.")
+        save_config_value('agent_token', None)
+        token = None
 
 
 if __name__ == '__main__':
@@ -648,7 +789,7 @@ if __name__ == '__main__':
                 print("[agent] No audio device available")
                 return
             print(f"[agent] Starting local capture (no backend)...")
-            await capture_loop(ws=None, device_id=device_id, loopback=(lb_id is not None))
+            await capture_loop(emit=None, device_id=device_id, loopback=(lb_id is not None))
 
         try:
             asyncio.run(local_main())

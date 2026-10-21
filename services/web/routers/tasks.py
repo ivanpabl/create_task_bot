@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import case, select
 from uuid import UUID
 from typing import Optional
 
@@ -10,6 +10,9 @@ from services.web.schemas import TaskOut, TaskUpdate
 from services.web.dependencies import get_current_user
 
 router = APIRouter(prefix='/api/tasks', tags=['tasks'])
+
+# Urgency is stored as text, so ordering by the column itself would be alphabetical.
+URGENCY_RANK = case({'high': 0, 'medium': 1, 'low': 2}, value=Task.urgency, else_=3)
 
 
 @router.get('', response_model=list[TaskOut])
@@ -27,7 +30,7 @@ async def list_tasks(
         query = query.where(Task.urgency == urgency)
     if source:
         query = query.where(Task.source == source)
-    query = query.order_by(Task.urgency.desc())
+    query = query.order_by(URGENCY_RANK)
     result = await db.execute(query)
     return result.scalars().all()
 
@@ -45,7 +48,7 @@ async def update_task(
         raise HTTPException(status_code=404, detail='Task not found')
 
     if data.status is not None:
-        task.status = data.status
+        task.status = data.status.value
     if data.assignee is not None:
         task.assignee = data.assignee
 

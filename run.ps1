@@ -86,7 +86,7 @@ $Jobs += Start-Job -Name "backend" -ScriptBlock {
     Set-Location $Root
     $env:POSTGRES_DSN = "postgresql+asyncpg://postgres:postgres@localhost:5432/discord_tasks"
     $env:BACKEND_URL = "http://localhost:8000"
-    python -m uvicorn services.web.main:app --host 0.0.0.0 --port 8000
+    python -m uvicorn services.web.main:app --host 127.0.0.1 --port 8000 --ws-max-size 65536 --ws-ping-interval 20 --ws-ping-timeout 20
 } -ArgumentList $Root
 
 Start-Sleep -Seconds 3

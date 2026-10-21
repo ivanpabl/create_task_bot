@@ -1,11 +1,12 @@
 # Discord Task Bot — Desktop Agent Configuration
-# Copy this file as config.yml and edit the values.
+# Normally you don't edit this file: download the agent from the site (config is
+# pre-filled), or leave agent_token empty and enter a pairing code on first launch.
 
-# Your Discord user ID (right-click profile → Copy ID)
-discord_id: "123456789012345678"
+# Backend URL. Must be https:// (http:// is allowed only for localhost).
+backend_url: "https://create-task.ru"
 
-# Backend URL (developer's server with ngrok or VPS)
-backend_url: "https://your-bot.ngrok.io"
+# Personal credential issued by the site. Do not share it.
+# agent_token: ""
 
 # Whisper model settings (optional)
 # whisper_model: "medium"     # tiny, base, small, medium, large-v3 (medium — баланс качества и размера)

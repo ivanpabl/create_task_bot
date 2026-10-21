@@ -117,6 +117,22 @@ docker compose exec ollama ollama pull qwen2.5:7b
 | `OLLAMA_MODEL` | Модель Ollama (qwen2.5:7b, llama3.2:3b) |
 | `ALERT_WEBHOOK_URL` | Discord Webhook для уведомлений об ошибках |
 
+#### TLS и WebSocket
+
+API слушает только `127.0.0.1:8100` и должен стоять за reverse proxy с TLS. Пример — [deploy/nginx.conf.example](deploy/nginx.conf.example).
+`BACKEND_URL` обязан быть `https://...`: он попадает в конфиг скачиваемого агента, и агент отказывается подключаться по `http://`/`ws://` (кроме `localhost`).
+Для лимитов по IP укажите в `.env` `FORWARDED_ALLOW_IPS` — адрес прокси, как его видит контейнер (обычно шлюз Docker, например `172.17.0.1`).
+
+Протокол агента (`/api/agent/ws`):
+- аутентификация — `Authorization: Bearer <agent_token>` при handshake; токен (JWT `typ=agent`, 365 дней) выдаётся в `config.yml` при скачивании или по пин-коду (`POST /api/pairing/claim`). Отозвать все токены можно только сменой `JWT_SECRET`;
+- одно соединение на пользователя: новое вытесняет старое (close `4000`), незавершённый звонок переходит к новому;
+- транскрипции, `call_start`/`call_end` идут с `seq`/`stream_id`, сервер отвечает `ack` и отбрасывает дубли; агент хранит неподтверждённое (до 500 сообщений) и досылает после переподключения;
+- при обрыве сессия звонка ждёт переподключения 60 с, затем уходит на суммаризацию; суммаризация выполняется в фоновой очереди и не блокирует приём;
+- heartbeat — WebSocket ping каждые 20 с, таймаут 20 с; переподключение агента — экспоненциальный backoff 1–60 с с jitter;
+- лимиты — кадр до 64 KiB, транскрипция до 8000 символов, ~10 сообщений/с на соединение агента, 2/с на дашборд, 10 неудачных пин-кодов на IP за 10 минут.
+
+Дашборд (`/api/agent/ws/frontend`) передаёт JWT первым сообщением `{"type":"auth","token":...}` и видит только своего агента.
+
 ### Сборка Desktop Agent (.exe)
 
 Для сборки требуется **Windows** (агент работает только на Windows).
@@ -154,3 +170,42 @@ cd frontend && npm run dev
 # Агент (требуется Windows + микрофон)
 python desktop_agent/agent.py --local
 ```
+
+### Аналитика в ClickHouse
+
+Если задан `CLICKHOUSE_URL`, API раз в минуту выгружает задачи из PostgreSQL в витрину `tasks_mart` (движок `ReplacingMergeTree(version)`, ключ `(user_id, id)`). Каждая выгрузка отправляет снимок с новой версией, поэтому изменения статуса доходят до витрины, а дубли схлопываются при слиянии кусков. Запросы к витрине используют `FINAL`. Код в `services/analytics/clickhouse.py`.
+
+```bash
+docker compose exec clickhouse clickhouse-client -u analytics --password analytics \
+  -q "SELECT urgency, status, count() FROM tasks_mart FINAL GROUP BY urgency, status"
+```
+
+### Тесты
+
+Тесты на pytest лежат в `tests/` и запускаются в GitHub Actions на каждый push ([tests.yml](.github/workflows/tests.yml)).
+
+| Папка | Что проверяется |
+| --- | --- |
+| `tests/unit` | Извлечение задач из сообщений, парсинг ответов LLM, JWT, rate limiting, сессии звонков в `AgentManager` |
+| `tests/api` | REST и WebSocket: авторизация, привязка агента по коду, команды дашборда, лимиты сообщений |
+| `tests/integration` | API поверх настоящего PostgreSQL: фильтры задач, изоляция пользователей, запись сообщений и транскрипций. Сверка витрины в ClickHouse с PostgreSQL: количество строк, дубли, агрегаты |
+
+```bash
+pip install -r requirements-dev.txt
+
+# Unit- и API-тесты (база не нужна)
+pytest
+
+# Вместе с интеграционными тестами на PostgreSQL
+docker run -d --rm --name test-db -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test \
+  -e POSTGRES_DB=test -p 127.0.0.1:55432:5432 postgres:16-alpine
+TEST_POSTGRES_DSN=postgresql+asyncpg://test:test@127.0.0.1:55432/test pytest
+
+# Плюс тесты витрины в ClickHouse
+docker run -d --rm --name test-ch -e CLICKHOUSE_USER=test -e CLICKHOUSE_PASSWORD=test \
+  -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 -p 127.0.0.1:58123:8123 clickhouse/clickhouse-server:24.8-alpine
+TEST_POSTGRES_DSN=postgresql+asyncpg://test:test@127.0.0.1:55432/test \
+TEST_CLICKHOUSE_URL=http://127.0.0.1:58123 TEST_CLICKHOUSE_USER=test TEST_CLICKHOUSE_PASSWORD=test pytest
+```
+
+Тесты с комментарием `Regression:` закрепляют исправленные баги.
