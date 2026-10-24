@@ -1,4 +1,6 @@
 export {
+  ApiError,
+  getToken,
   setToken,
   clearToken,
   isAuthenticated,
@@ -7,5 +9,7 @@ export {
   getMe,
   getTasks,
   updateTask,
+  getPairingCode,
+  downloadAgent,
 } from './client';
-export type { User, Task, AuthResponse } from './client';
+export type { User, Task, TaskStatus, Urgency, AuthResponse, PairingCode } from './client';
