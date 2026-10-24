@@ -1,50 +1,73 @@
-import { Outlet, Link, useNavigate, useLocation } from 'react-router-dom';
-import { isAuthenticated, clearToken } from '../api';
+import { useEffect, useState } from 'react';
+import { Outlet, Link, NavLink, useNavigate } from 'react-router-dom';
+import { isAuthenticated, clearToken, getMe, type User } from '../api';
+import Icon, { type IconName } from './Icon';
+
+const NAV: { to: string; label: string; icon: IconName }[] = [
+  { to: '/', label: 'Задачи', icon: 'tasks' },
+  { to: '/download', label: 'Скачать агента', icon: 'download' },
+  { to: '/settings', label: 'Агент', icon: 'agent' },
+];
 
 export default function Layout() {
   const navigate = useNavigate();
-  const location = useLocation();
   const authed = isAuthenticated();
+  const [user, setUser] = useState<User | null>(null);
+
+  useEffect(() => {
+    if (!authed) return;
+    getMe().then(setUser).catch(() => {});
+  }, [authed]);
 
   const handleLogout = () => {
     clearToken();
+    setUser(null);
     navigate('/login');
   };
 
-  const isActive = (path: string) => location.pathname === path;
-
-  const linkClass = (path: string) =>
-    `px-4 py-2 rounded-lg text-sm font-medium border transition ${
-      isActive(path)
-        ? 'bg-indigo-600 border-indigo-500 text-white'
-        : 'border-gray-600 text-gray-300 hover:bg-gray-700 hover:border-gray-500 hover:text-white'
-    }`;
-
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-100">
-      <nav className="bg-gray-800 border-b border-gray-700 px-6 py-2 flex items-center justify-between shadow-sm">
-        <div className="flex items-center gap-2">
-          <Link to="/" className="text-lg font-bold text-indigo-400 mr-4">TaskBot</Link>
+    <>
+      <header className="header">
+        <div className="header-inner">
+          <Link to="/" className="brand">
+            <span className="brand-mark"><Icon name="logo" /></span>
+            <span className="brand-name">TaskBot</span>
+          </Link>
+
           {authed && (
-            <div className="flex gap-1">
-              <Link to="/" className={linkClass('/')}>Tasks</Link>
-              <Link to="/download" className={linkClass('/download')}>Download Agent</Link>
-              <Link to="/settings" className={linkClass('/settings')}>Settings</Link>
+            <nav className="nav">
+              {NAV.map(item => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end
+                  className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+                >
+                  <Icon name={item.icon} />
+                  <span className="label">{item.label}</span>
+                </NavLink>
+              ))}
+            </nav>
+          )}
+
+          {authed && (
+            <div className="header-user">
+              {user && (
+                <>
+                  <span className="avatar" aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</span>
+                  <span className="user-name">{user.username}</span>
+                </>
+              )}
+              <button className="btn btn-ghost btn-icon" onClick={handleLogout} title="Выйти" aria-label="Выйти">
+                <Icon name="logout" />
+              </button>
             </div>
           )}
         </div>
-        {authed && (
-          <button
-            onClick={handleLogout}
-            className="px-4 py-2 rounded-lg text-sm font-medium border border-red-700 text-red-400 hover:bg-red-600 hover:border-red-500 hover:text-white transition"
-          >
-            Logout
-          </button>
-        )}
-      </nav>
-      <main className="p-6 max-w-5xl mx-auto">
+      </header>
+      <main className="main">
         <Outlet />
       </main>
-    </div>
+    </>
   );
 }

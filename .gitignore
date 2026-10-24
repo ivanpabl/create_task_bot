@@ -21,6 +21,7 @@ desktop_agent/__pycache__/
 *.json
 !package.json
 !package-lock.json
+!tsconfig*.json
 recordings/
 
 # Frontend

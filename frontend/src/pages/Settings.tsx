@@ -1,4 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { getToken } from '../api';
+import Icon, { type IconName } from '../components/Icon';
 
 const WS_BASE = import.meta.env.VITE_WS_URL || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
 
@@ -18,6 +21,28 @@ interface Transcription {
   timestamp: string;
 }
 
+type Tone = 'green' | 'amber' | 'red' | 'blue';
+
+function describe(connected: boolean, agentConnected: boolean, status: string): { title: string; text: string; tone: Tone; icon: IconName } {
+  if (!connected) return { title: 'Нет связи с сервером', text: 'Переподключаемся…', tone: 'red', icon: 'plug' };
+  if (!agentConnected) return { title: 'Агент не в сети', text: 'Запустите discord-task-agent.exe на компьютере.', tone: 'red', icon: 'monitor' };
+  if (status === 'listening') return { title: 'Слушаю', text: 'Звук захватывается и распознаётся.', tone: 'green', icon: 'mic' };
+  if (status === 'processing') return { title: 'Обработка', text: 'Распознаём фрагмент речи…', tone: 'blue', icon: 'wave' };
+  if (status === 'idle') return { title: 'Ожидание', text: 'Выберите устройство и запустите захват.', tone: 'amber', icon: 'monitor' };
+  return { title: status, text: '', tone: 'amber', icon: 'monitor' };
+}
+
+function ConnRow({ label, ok, okText, failText }: { label: string; ok: boolean; okText: string; failText: string }) {
+  return (
+    <div className="conn">
+      <span className="muted">{label}</span>
+      <span className="conn-state" style={{ ['--c' as string]: ok ? 'var(--green)' : 'var(--text-3)' }}>
+        <span className="dot" />{ok ? okText : failText}
+      </span>
+    </div>
+  );
+}
+
 export default function Agent() {
   const [connected, setConnected] = useState(false);
   const [agentConnected, setAgentConnected] = useState(false);
@@ -27,75 +52,78 @@ export default function Agent() {
   const [transcriptions, setTranscriptions] = useState<Transcription[]>([]);
   const [agentUserId, setAgentUserId] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const retryDelayRef = useRef(RECONNECT_MIN_MS);
-  const retryTimerRef = useRef<number | null>(null);
-  const unmountedRef = useRef(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const feedRef = useRef<HTMLDivElement>(null);
 
+  // Newest entries are on top: keep the feed pinned there as they arrive.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    feedRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
   }, [transcriptions]);
 
-  const connect = useCallback(() => {
-    const token = localStorage.getItem('jwt_token');
-    if (!token) return;
-
-    const ws = new WebSocket(`${WS_BASE}/api/agent/ws/frontend`);
-    wsRef.current = ws;
-
-    // Browsers can't set WebSocket headers; the JWT goes in the first message, never in the URL.
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'auth', token }));
-      setConnected(true);
-      retryDelayRef.current = RECONNECT_MIN_MS;
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        switch (msg.type) {
-          case 'status':
-            setAgentConnected(!!msg.connected);
-            setAgentStatus(msg.status);
-            setSelectedDeviceId(msg.device_id ?? null);
-            if (msg.devices) setDevices(msg.devices);
-            setAgentUserId(msg.user_id ?? null);
-            break;
-          case 'devices':
-            setDevices(msg.devices);
-            if (msg.device_id != null) setSelectedDeviceId(msg.device_id);
-            break;
-          case 'transcription':
-            setTranscriptions((prev) => [
-              { text: msg.text, timestamp: msg.timestamp },
-              ...prev,
-            ].slice(0, 100));
-            break;
-        }
-      } catch {}
-    };
-
-    ws.onclose = (event) => {
-      setConnected(false);
-      setAgentConnected(false);
-      if (unmountedRef.current || event.code === CLOSE_UNAUTHORIZED) return;
-      const delay = retryDelayRef.current * (0.5 + Math.random() / 2);
-      retryDelayRef.current = Math.min(retryDelayRef.current * 2, RECONNECT_MAX_MS);
-      retryTimerRef.current = window.setTimeout(connect, delay);
-    };
-
-    ws.onerror = () => ws.close();
-  }, []);
-
   useEffect(() => {
-    unmountedRef.current = false;
+    let unmounted = false;
+    let retryDelay = RECONNECT_MIN_MS;
+    let retryTimer: number | null = null;
+
+    const connect = () => {
+      const token = getToken();
+      if (!token) return;
+
+      const ws = new WebSocket(`${WS_BASE}/api/agent/ws/frontend`);
+      wsRef.current = ws;
+
+      // Browsers can't set WebSocket headers; the JWT goes in the first message, never in the URL.
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'auth', token }));
+        setConnected(true);
+        retryDelay = RECONNECT_MIN_MS;
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          switch (msg.type) {
+            case 'status':
+              setAgentConnected(!!msg.connected);
+              setAgentStatus(msg.status);
+              setSelectedDeviceId(msg.device_id ?? null);
+              if (msg.devices) setDevices(msg.devices);
+              setAgentUserId(msg.user_id ?? null);
+              break;
+            case 'devices':
+              setDevices(msg.devices);
+              if (msg.device_id != null) setSelectedDeviceId(msg.device_id);
+              break;
+            case 'transcription':
+              setTranscriptions((prev) => [
+                { text: msg.text, timestamp: msg.timestamp },
+                ...prev,
+              ].slice(0, 100));
+              break;
+          }
+        } catch {
+          // Ignore malformed frames.
+        }
+      };
+
+      ws.onclose = (event) => {
+        setConnected(false);
+        setAgentConnected(false);
+        if (unmounted || event.code === CLOSE_UNAUTHORIZED) return;
+        const delay = retryDelay * (0.5 + Math.random() / 2);
+        retryDelay = Math.min(retryDelay * 2, RECONNECT_MAX_MS);
+        retryTimer = window.setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => ws.close();
+    };
+
     connect();
     return () => {
-      unmountedRef.current = true;
-      if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+      unmounted = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
       wsRef.current?.close();
     };
-  }, [connect]);
+  }, []);
 
   const sendCommand = (action: string, params?: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -104,80 +132,107 @@ export default function Agent() {
   };
 
   const isListening = agentStatus === 'listening' || agentStatus === 'processing';
+  const online = connected && agentConnected;
+  const state = describe(connected, agentConnected, agentStatus);
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-sm">
-        <h2 className="text-xl font-bold mb-4">Desktop Agent</h2>
-
-        <div className="flex items-center gap-4 mb-6 bg-gray-900/50 rounded-lg p-4 border border-gray-700">
-          <div className={`w-3.5 h-3.5 rounded-full ${
-            connected && agentConnected ? (isListening ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : 'bg-yellow-500 shadow-[0_0_8px_rgba(234,179,8,0.5)]') : 'bg-red-500'
-          }`} />
-          <div>
-            <span className="text-sm font-medium">
-              {!connected ? 'Disconnected' : !agentConnected ? 'Agent offline' : agentStatus === 'idle' ? 'Idle' : agentStatus === 'listening' ? 'Listening...' : agentStatus === 'processing' ? 'Processing...' : agentStatus}
-            </span>
-            {agentUserId && (
-              <span className="text-xs text-green-400 ml-3">✓ User linked</span>
-            )}
-          </div>
+    <div className="page stack">
+      <div className="page-head" style={{ marginBottom: 8 }}>
+        <div>
+          <h1 className="page-title">Агент</h1>
+          <p className="page-sub">Управление захватом звука и живая расшифровка звонков.</p>
         </div>
+      </div>
 
-        <div className="flex items-end gap-3">
-          <div className="flex-1">
-            <label className="text-xs text-gray-400 mb-1 block">Audio device</label>
+      <div className="grid grid-2">
+        <section className="card card-body">
+          <div className="status-panel">
+            <span className={`status-orb orb-${state.tone}${online && isListening ? ' on' : ''}`}>
+              <Icon name={state.icon} className="icon icon-lg" />
+            </span>
+            <div>
+              <div className="status-title">{state.title}</div>
+              <div className="muted" style={{ fontSize: 14 }}>{state.text}</div>
+            </div>
+          </div>
+
+          {!agentConnected && connected && (
+            <Link to="/download" className="btn btn-secondary btn-sm" style={{ marginTop: 18 }}>
+              <Icon name="download" className="icon icon-sm" />Скачать агента
+            </Link>
+          )}
+        </section>
+
+        <section className="card card-body conn-list">
+          <ConnRow label="Сервер" ok={connected} okText="Подключён" failText="Нет связи" />
+          <ConnRow label="Desktop-агент" ok={agentConnected} okText="В сети" failText="Не в сети" />
+          <ConnRow label="Аккаунт" ok={!!agentUserId} okText="Привязан" failText="Не привязан" />
+          <ConnRow label="Устройства" ok={devices.length > 0} okText={`Найдено: ${devices.length}`} failText="Нет данных" />
+        </section>
+      </div>
+
+      <section className="card card-body">
+        <div className="controls">
+          <div>
+            <label className="field-label" htmlFor="device">Аудиоустройство</label>
             <select
-              className="bg-gray-700 border border-gray-600 rounded-lg px-3 py-2.5 text-sm w-full"
+              id="device"
+              className="select"
               value={selectedDeviceId ?? ''}
+              disabled={!online || devices.length === 0}
               onChange={(e) => {
                 const id = Number(e.target.value);
                 setSelectedDeviceId(id);
                 sendCommand('select_device', { device_id: id });
               }}
             >
-              <option value="" disabled>Select audio device...</option>
+              <option value="" disabled>{devices.length ? 'Выберите устройство…' : 'Устройства появятся, когда агент подключится'}</option>
               {devices.map((d) => (
-                <option key={d.id} value={d.id}>{d.name}{d.channels != null ? ` (${d.channels} ch)` : ''}</option>
+                <option key={d.id} value={d.id}>{d.name}{d.channels != null ? ` · ${d.channels} кан.` : ''}</option>
               ))}
             </select>
           </div>
 
           <button
             onClick={() => sendCommand(isListening ? 'stop' : 'start')}
-            disabled={!connected || !agentConnected || selectedDeviceId == null || devices.length === 0}
-            className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition shadow-sm ${
-              isListening
-                ? 'bg-red-600 hover:bg-red-500 text-white'
-                : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-            } disabled:opacity-40 disabled:cursor-not-allowed`}
+            disabled={!online || selectedDeviceId == null || devices.length === 0}
+            className={`btn ${isListening ? 'btn-danger' : 'btn-primary'}`}
+            style={{ minWidth: 170 }}
           >
-            {isListening ? 'Stop Capture' : 'Start Capture'}
+            <Icon name={isListening ? 'stop' : 'play'} className="icon icon-sm" />
+            {isListening ? 'Остановить захват' : 'Начать захват'}
           </button>
         </div>
-      </div>
+      </section>
 
-      <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-sm">
-        <h3 className="text-lg font-bold mb-3">Live Transcriptions</h3>
-
-        <div className="bg-gray-900/50 rounded-lg h-96 overflow-y-auto space-y-2 p-3 border border-gray-700">
+      <section className="card">
+        <div className="card-head">
+          <div className="card-title"><Icon name="wave" />Живая расшифровка</div>
+          {online && isListening
+            ? <span className="live">В эфире</span>
+            : <span className="faint" style={{ fontSize: 13 }}>{transcriptions.length} фрагм.</span>}
+        </div>
+        <div className="feed" ref={feedRef}>
           {transcriptions.length === 0 ? (
-            <p className="text-gray-500 text-sm text-center mt-20">
-              {!connected ? 'Connecting...' : 'No transcriptions yet. Start the agent.'}
-            </p>
+            <div className="empty">
+              <div className="empty-icon">
+                {connected ? <Icon name="mic" className="icon icon-lg" /> : <span className="spinner" />}
+              </div>
+              <h3>{connected ? 'Пока тихо' : 'Подключение…'}</h3>
+              <p>{connected ? 'Расшифровки появятся здесь, как только агент начнёт слушать.' : 'Устанавливаем соединение с сервером.'}</p>
+            </div>
           ) : (
             transcriptions.map((t, i) => (
-              <div key={i} className="bg-gray-800 rounded-lg px-4 py-3 border border-gray-700">
-                <div className="text-gray-500 text-xs mb-1">
-                  {new Date(t.timestamp).toLocaleTimeString()}
-                </div>
-                <div className="text-sm leading-relaxed">{t.text}</div>
+              <div key={`${t.timestamp}-${transcriptions.length - i}`} className="feed-item">
+                <span className="feed-time">
+                  {new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </span>
+                <span className="feed-text">{t.text}</span>
               </div>
             ))
           )}
-          <div ref={bottomRef} />
         </div>
-      </div>
+      </section>
     </div>
   );
 }

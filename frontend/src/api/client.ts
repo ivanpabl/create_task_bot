@@ -1,35 +1,50 @@
 const API_BASE = import.meta.env.VITE_API_URL || '';
+const TOKEN_KEY = 'jwt_token';
 
-function getToken(): string | null {
-  return localStorage.getItem('jwt_token');
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
 }
 
 export function setToken(token: string) {
-  localStorage.setItem('jwt_token', token);
+  localStorage.setItem(TOKEN_KEY, token);
 }
 
 export function clearToken() {
-  localStorage.removeItem('jwt_token');
+  localStorage.removeItem(TOKEN_KEY);
 }
 
 export function isAuthenticated(): boolean {
   return !!getToken();
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function raw(path: string, options: RequestInit = {}): Promise<Response> {
   const token = getToken();
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
     ...((options.headers as Record<string, string>) || {}),
   };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
+  if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!res.ok) {
     if (res.status === 401) clearToken();
-    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === 'string' ? body.detail : res.statusText;
+    throw new ApiError(res.status, detail || `HTTP ${res.status}`);
   }
+  return res;
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await raw(path, options);
   return res.json();
 }
 
@@ -38,6 +53,9 @@ export interface User {
   discord_id: string;
   username: string;
 }
+
+export type TaskStatus = 'open' | 'in_progress' | 'done';
+export type Urgency = 'high' | 'medium' | 'low';
 
 export interface Task {
   id: string;
@@ -48,8 +66,8 @@ export interface Task {
   author: string | null;
   assignee: string | null;
   deadline: string | null;
-  urgency: string;
-  status: string;
+  urgency: Urgency | string;
+  status: TaskStatus | string;
   channel: string | null;
   guild_id: string | null;
   keywords: string[] | null;
@@ -58,6 +76,11 @@ export interface Task {
 export interface AuthResponse {
   token: string;
   user: User;
+}
+
+export interface PairingCode {
+  code: string;
+  expires_in: number;
 }
 
 export function getAuthUrl(): string {
@@ -90,4 +113,21 @@ export function updateTask(id: string, data: { status?: string; assignee?: strin
     method: 'PATCH',
     body: JSON.stringify(data),
   });
+}
+
+export function getPairingCode(): Promise<PairingCode> {
+  return request<PairingCode>('/api/pairing/code');
+}
+
+export async function downloadAgent(filename = 'discord-task-agent.zip'): Promise<void> {
+  const res = await raw('/api/agent/download');
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }

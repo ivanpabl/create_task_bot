@@ -1,18 +1,17 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { exchangeToken, setToken } from '../api';
+import Icon from '../components/Icon';
 
 export default function Callback() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const [error, setError] = useState('');
+  const hasCode = !!searchParams.get('code');
+  const [exchangeError, setError] = useState('');
+  const error = hasCode ? exchangeError : 'Discord не вернул код авторизации';
 
   useEffect(() => {
-    const code = searchParams.get('code');
-    if (!code) {
-      setError('No authorization code received');
-      return;
-    }
+    if (!hasCode) return;
 
     (async () => {
       try {
@@ -21,17 +20,31 @@ export default function Callback() {
           setToken(resp.token);
           navigate('/', { replace: true });
         } else {
-          setError('Failed to exchange token');
+          setError('Не удалось получить токен');
         }
-      } catch (e) {
-        setError('Authentication failed');
+      } catch {
+        setError('Ошибка авторизации');
       }
     })();
-  }, [searchParams, navigate]);
+  }, [hasCode, navigate]);
 
   if (error) {
-    return <div className="text-red-400 text-center mt-10">{error}</div>;
+    return (
+      <div className="page center">
+        <div className="empty-icon" style={{ color: 'var(--red)' }}><Icon name="alert" className="icon icon-lg" /></div>
+        <div>
+          <h2 className="card-title" style={{ justifyContent: 'center' }}>{error}</h2>
+          <p className="muted">Попробуйте войти ещё раз.</p>
+        </div>
+        <Link to="/login" className="btn btn-primary">Вернуться ко входу</Link>
+      </div>
+    );
   }
 
-  return <div className="text-center text-gray-400 mt-10">Authenticating...</div>;
+  return (
+    <div className="page center">
+      <span className="spinner spinner-lg" />
+      <p className="muted">Выполняем вход…</p>
+    </div>
+  );
 }

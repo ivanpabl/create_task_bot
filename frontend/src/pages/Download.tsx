@@ -1,42 +1,52 @@
 import { useEffect, useState } from 'react';
-import { getMe } from '../api';
+import { downloadAgent, getMe, getPairingCode } from '../api';
+import CopyButton from '../components/CopyButton';
+import Icon from '../components/Icon';
 
-const API_BASE = import.meta.env.VITE_API_URL || '';
+const STEPS = [
+  { title: 'Скачайте и распакуйте архив', text: 'В любую папку — установка не требуется.' },
+  { title: 'Запустите discord-task-agent.exe', text: 'Конфиг с вашим Discord ID уже внутри архива.' },
+  { title: 'Дождитесь загрузки модели', text: 'При первом запуске скачивается Whisper (~1.5 ГБ), это 1–3 минуты.' },
+  { title: 'Зайдите в голосовой канал', text: 'Когда в терминале появится «listening», агент готов к работе.' },
+];
+
+function formatLeft(sec: number) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
 
 export default function Download() {
   const [discordId, setDiscordId] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState('');
+
   const [pairingCode, setPairingCode] = useState<string | null>(null);
-  const [pairingCopied, setPairingCopied] = useState(false);
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const [pairingLoading, setPairingLoading] = useState(false);
   const [pairingError, setPairingError] = useState('');
-  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
-    getMe().then((user) => {
-      setDiscordId(user.discord_id);
-    }).catch(() => {});
+    getMe().then(u => setDiscordId(u.discord_id)).catch(() => {});
   }, []);
 
-  const downloadAgent = async () => {
+  useEffect(() => {
+    if (!pairingCode) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [pairingCode]);
+
+  const secondsLeft = Math.max(0, Math.round((expiresAt - now) / 1000));
+  const expired = !!pairingCode && secondsLeft === 0;
+
+  const handleDownload = async () => {
     setDownloading(true);
+    setDownloadError('');
     try {
-      const token = localStorage.getItem('jwt_token');
-      const resp = await fetch(`${API_BASE}/api/agent/download`, {
-        headers: { 'Authorization': `Bearer ${token}` },
-      });
-      if (!resp.ok) throw new Error('Download failed');
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'discord-task-agent.zip';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setPairingError(e.message || 'Failed to download');
+      await downloadAgent();
+    } catch (e) {
+      setDownloadError(e instanceof Error ? e.message : 'Не удалось скачать агента');
     } finally {
       setDownloading(false);
     }
@@ -46,159 +56,117 @@ export default function Download() {
     setPairingLoading(true);
     setPairingError('');
     try {
-      const resp = await fetch(`${API_BASE}/api/pairing/code`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('jwt_token')}` },
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || 'Failed to generate code');
-      }
-      const data = await resp.json();
+      const data = await getPairingCode();
       setPairingCode(data.code);
-    } catch (e: any) {
-      setPairingError(e.message || 'Failed to generate pairing code');
+      setNow(Date.now());
+      setExpiresAt(Date.now() + data.expires_in * 1000);
+    } catch (e) {
+      setPairingError(e instanceof Error ? e.message : 'Не удалось получить код');
     } finally {
       setPairingLoading(false);
     }
   };
 
-  const copyPairingCode = async () => {
-    if (pairingCode) {
-      await navigator.clipboard.writeText(pairingCode);
-      setPairingCopied(true);
-      setTimeout(() => setPairingCopied(false), 2000);
-    }
-  };
-
-  const handleCopyId = async () => {
-    if (discordId) {
-      await navigator.clipboard.writeText(discordId);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  };
+  const chars = pairingCode ? pairingCode.split('') : [];
+  const half = Math.ceil(chars.length / 2);
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-sm">
-        <h2 className="text-xl font-bold mb-2">Desktop Agent</h2>
-        <p className="text-gray-400 text-sm mb-6">
-          Records desktop audio during Discord voice calls, transcribes speech, and creates tasks.
-        </p>
-
-        <div className="bg-gray-900/50 rounded-lg p-4 mb-6 border border-gray-700">
-          <p className="text-sm text-gray-400 mb-2">Your Discord ID:</p>
-          <div className="flex items-center gap-2">
-            <code className="text-base text-indigo-300 font-mono bg-gray-800 px-3 py-2 rounded flex-1 border border-gray-600 truncate">
-              {discordId || 'Loading...'}
-            </code>
-            <button
-              onClick={handleCopyId}
-              disabled={!discordId}
-              className="px-4 py-2 rounded text-sm font-medium bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed transition"
-            >
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
+    <div className="page stack">
+      <div className="page-head" style={{ marginBottom: 8 }}>
+        <div>
+          <h1 className="page-title">Desktop-агент</h1>
+          <p className="page-sub">Записывает звук звонков Discord, распознаёт речь и создаёт задачи.</p>
         </div>
+      </div>
 
-        <div className="flex flex-wrap gap-3 mb-4">
-          <button
-            onClick={downloadAgent}
-            disabled={downloading}
-            className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-6 py-3 rounded-lg transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {downloading ? (
-              <>
-                <svg className="animate-spin w-5 h-5" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                </svg>
-                Downloading...
-              </>
-            ) : (
-              <>
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-                </svg>
-                Download Agent (Windows)
-              </>
-            )}
+      <section className="card card-body">
+        <div className="download-hero">
+          <div style={{ flex: 1, minWidth: 260 }}>
+            <div className="card-title">
+              <span className="feature-icon"><Icon name="windows" /></span>
+              Агент для Windows
+            </div>
+            <div className="download-meta">
+              <span><Icon name="check" />Discord ID уже в конфиге</span>
+              <span><Icon name="check" />Без установки</span>
+              <span><Icon name="check" />~30 МБ + модель Whisper ~1.5 ГБ</span>
+            </div>
+          </div>
+          <button className="btn btn-primary btn-lg" onClick={handleDownload} disabled={downloading}>
+            {downloading ? <span className="spinner" /> : <Icon name="download" />}
+            {downloading ? 'Подготовка архива…' : 'Скачать агента'}
           </button>
         </div>
 
-        <p className="text-xs text-gray-500">
-          ✓ Already includes your Discord ID — just extract and run
-        </p>
-        <p className="text-xs text-gray-500 mt-1">
-          ~30 MB + ~1.5 GB Whisper model (downloaded on first launch)
-        </p>
-      </div>
+        {downloadError && <div className="alert" style={{ marginTop: 16 }}><Icon name="alert" />{downloadError}</div>}
 
-      <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-sm">
-        <h3 className="text-lg font-bold mb-2">Pairing Code</h3>
-        <p className="text-gray-400 text-sm mb-4">
-          Alternative: on first launch the agent will ask for a code. Generate one below and enter it in the agent terminal.
-        </p>
-
-        {pairingCode ? (
-          <div className="flex items-center gap-3 bg-gray-900/50 rounded-lg p-4 border border-gray-700">
-            <code className="text-2xl text-indigo-300 font-mono bg-gray-800 px-4 py-2 rounded tracking-widest border border-gray-600">
-              {pairingCode}
-            </code>
-            <button
-              onClick={copyPairingCode}
-              className="px-4 py-2 rounded text-sm font-medium bg-gray-700 hover:bg-gray-600 transition"
-            >
-              {pairingCopied ? 'Copied!' : 'Copy'}
-            </button>
-            <span className="text-xs text-gray-500">valid for 10 min</span>
+        <div style={{ marginTop: 24 }}>
+          <span className="field-label">Ваш Discord ID</span>
+          <div className="copy-field">
+            <code>{discordId || 'Загрузка…'}</code>
+            <CopyButton value={discordId} />
           </div>
-        ) : (
-          <div>
-            <button
-              onClick={generatePairingCode}
-              disabled={pairingLoading}
-              className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-6 py-3 rounded-lg transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {pairingLoading ? (
-                <>
-                  <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                  </svg>
-                  Generating...
-                </>
-              ) : (
-                'Generate Code'
-              )}
-            </button>
-            {pairingError && (
-              <p className="text-red-400 text-sm mt-2">{pairingError}</p>
+        </div>
+      </section>
+
+      <div className="grid grid-2">
+        <section className="card">
+          <div className="card-head">
+            <div>
+              <div className="card-title"><Icon name="key" />Код привязки</div>
+              <p className="card-desc">Альтернатива конфигу: агент спросит код при первом запуске.</p>
+            </div>
+          </div>
+          <div className="card-body">
+            {pairingCode && !expired ? (
+              <>
+                <div className="pair-code" aria-label={pairingCode}>
+                  {chars.slice(0, half).map((c, i) => <span key={i}>{c}</span>)}
+                  <span className="sep">–</span>
+                  {chars.slice(half).map((c, i) => <span key={i + half}>{c}</span>)}
+                </div>
+                <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <span className="faint" style={{ fontSize: 13 }}>
+                    Действует ещё <span className="timer">{formatLeft(secondsLeft)}</span>
+                  </span>
+                  <div className="row">
+                    <button className="btn btn-ghost btn-sm" onClick={generatePairingCode} disabled={pairingLoading}>
+                      <Icon name="refresh" className="icon icon-sm" />Новый
+                    </button>
+                    <CopyButton value={pairingCode} />
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="stack" style={{ alignItems: 'flex-start', gap: 12 }}>
+                {expired && <p className="faint" style={{ fontSize: 14 }}>Срок действия кода истёк.</p>}
+                <button className="btn btn-secondary" onClick={generatePairingCode} disabled={pairingLoading}>
+                  {pairingLoading ? <span className="spinner" /> : <Icon name="key" className="icon icon-sm" />}
+                  {pairingLoading ? 'Генерация…' : expired ? 'Получить новый код' : 'Получить код'}
+                </button>
+              </div>
             )}
+            {pairingError && <div className="alert" style={{ marginTop: 12 }}><Icon name="alert" />{pairingError}</div>}
           </div>
-        )}
-      </div>
+        </section>
 
-      <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 shadow-sm">
-        <h3 className="text-lg font-bold mb-3">Instructions</h3>
-        <ol className="text-sm text-gray-300 space-y-3">
-          {[
-            'Download the agent archive and extract to any folder',
-            'Config is already included with your Discord ID — no setup needed',
-            'Or generate a pairing code above and enter it on first launch instead',
-            'Run discord-task-agent.exe',
-            'Whisper model (~1.5 GB) will download on first launch — please wait',
-            'Status "listening" in terminal — agent is ready. Join a Discord voice channel',
-          ].map((step, i) => (
-            <li key={i} className="flex items-start gap-3">
-              <span className="flex items-center justify-center w-6 h-6 rounded-full bg-indigo-600 text-white text-xs font-bold shrink-0 mt-0.5">
-                {i + 1}
-              </span>
-              <span className="leading-relaxed">{step}</span>
-            </li>
-          ))}
-        </ol>
+        <section className="card">
+          <div className="card-head">
+            <div className="card-title"><Icon name="tasks" />Как начать</div>
+          </div>
+          <div className="card-body">
+            <ol className="steps">
+              {STEPS.map(s => (
+                <li key={s.title} className="step">
+                  <div>
+                    <h4>{s.title}</h4>
+                    <p>{s.text}</p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </section>
       </div>
     </div>
   );
